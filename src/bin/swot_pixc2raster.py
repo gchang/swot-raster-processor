@@ -219,7 +219,9 @@ def main():
     product.pge_version = VERSION_ID
     product.product_version = f'{args.product_counter:02}'
     product.xref_l2_hr_pixc_files = os.path.basename(args.pixc_file)
-    product.xref_l2_hr_pixcvec_files = os.path.basename(args.pixcvec_file)
+    if args.pixcvec_file is not None:
+        product.xref_l2_hr_pixcvec_files = os.path.basename(
+            args.pixcvec_file)
     product.xref_param_l2_hr_raster_file = os.path.basename(
         args.alg_config_file)
     product.to_ncfile(args.output_file)
