@@ -18,6 +18,16 @@ where ```pixc_file``` is the SWOT high-resolution pixel-cloud data product, ```a
 
 The software is dependent on the open source RiverObs code at https://github.com/SWOTAlgorithms/RiverObs and the SWOT Hydrology Toolbox at https://github.com/CNES/swot-hydrology-toolbox.
 
+## Requirements
+
+Python 3.11 or newer (the code uses `datetime.UTC`; 3.11 is the tested version) with numpy, scipy, netCDF4, GDAL, shapely, pyproj, bottleneck and rasterio. RiverObs and the toolbox have no tags and are not pip packages, so clone them and put their source folders on `PYTHONPATH`. Tested with RiverObs `develop` at commit `dc0c7fde` and swot-hydrology-toolbox `release_version_08_23_2022` at commit `9c72c352`:
+```
+git clone https://github.com/SWOTAlgorithms/RiverObs && git -C RiverObs checkout dc0c7fde
+git clone -b release_version_08_23_2022 https://github.com/CNES/swot-hydrology-toolbox && git -C swot-hydrology-toolbox checkout 9c72c352
+conda create -n raster -c conda-forge python=3.11 numpy scipy netcdf4 gdal shapely pyproj bottleneck rasterio
+export PYTHONPATH=/path/to/Raster-Processor/src:$PWD/RiverObs/src:$PWD/swot-hydrology-toolbox/processing/src
+```
+
 # Processing Information
 
 ![alt text](img/Fig1.png)
