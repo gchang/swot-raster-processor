@@ -1,0 +1,1378 @@
+'''
+Copyright (c) 2023-, California Institute of Technology ("Caltech"). U.S.
+Government sponsorship acknowledged.
+All rights reserved.
+
+Author (s): Alexander Corben (JPL)
+'''
+
+import logging
+import datetime
+import collections.abc
+import multiprocessing
+from functools import partial
+from itertools import groupby, chain, compress
+
+import numpy as np
+import rasterio.features
+import rasterio.transform
+import SWOTWater.aggregate as ag
+from osgeo import osr
+from shapely import affinity
+from shapely.geometry import Polygon
+
+from SWOTRaster import products
+from SWOTRaster import raster_agg
+from SWOTRaster import raster_crs
+from SWOTRaster.errors import RasterUsageException
+
+LOGGER = logging.getLogger(__name__)
+
+
+class RasterProcessor():
+    """ Raster processor """
+    def __init__(self, projection_type, resolution, padding,
+                 height_agg_method, area_agg_method, sig0_agg_method,
+                 interior_water_classes, water_edge_classes, land_edge_classes,
+                 dark_water_classes, low_coh_water_classes,
+                 use_bright_land, use_specular_not_intersecting_prior,
+                 specular_not_intersecting_prior_thresh,
+                 use_all_classes_for_wse, use_all_classes_for_sig0,
+                 wse_geo_qual_suspect, wse_geo_qual_degraded, wse_geo_qual_bad,
+                 area_geo_qual_suspect, area_geo_qual_degraded,
+                 area_geo_qual_bad, sig0_geo_qual_suspect,
+                 sig0_geo_qual_degraded, sig0_geo_qual_bad,
+                 wse_class_qual_suspect, wse_class_qual_degraded,
+                 wse_class_qual_bad, area_class_qual_suspect,
+                 area_class_qual_degraded, area_class_qual_bad,
+                 sig0_class_qual_suspect, sig0_class_qual_degraded,
+                 sig0_class_qual_bad, sig0_qual_suspect, sig0_qual_degraded,
+                 sig0_qual_bad, num_good_sus_pix_thresh_wse,
+                 num_good_sus_pix_thresh_water_area,
+                 num_good_sus_pix_thresh_sig0, pixc_water_frac_suspect_thresh,
+                 num_wse_pix_suspect_thresh, num_water_area_pix_suspect_thresh,
+                 num_sig0_pix_suspect_thresh,
+                 near_range_suspect_thresh, far_range_suspect_thresh,
+                 wse_uncert_suspect_thresh, water_frac_uncert_suspect_thresh,
+                 sig0_uncert_suspect_thresh,
+                 wse_bad_thresh_min, wse_bad_thresh_max,
+                 water_frac_bad_thresh_min, water_frac_bad_thresh_max,
+                 sig0_bad_thresh_min, sig0_bad_thresh_max,
+                 inner_swath_distance_thresh, missing_karin_data_time_thresh,
+                 ice_flag_valid_frac_thresh, ice_flag_value_frac_thresh,
+                 utm_zone_adjust=0, mgrs_band_adjust=0,
+                 utm_conversion_max_chunk_size=products.DEFAULT_MAX_CHUNK_SIZE,
+                 aggregator_max_chunk_size=products.DEFAULT_MAX_CHUNK_SIZE,
+                 skip_wse=False, skip_area=False, skip_sig0=False,
+                 max_worker_processes=0, debug_flag=False):
+        self.projection_type = projection_type
+        if self.projection_type.lower() == 'geo':
+            # Geodetic resolution is given in arcsec
+            self.resolution = float(resolution / (60 * 60))
+        elif self.projection_type.lower() == 'utm':
+            self.resolution = float(resolution)
+            self.utm_zone_adjust = utm_zone_adjust
+            self.mgrs_band_adjust = mgrs_band_adjust
+            self.utm_conversion_max_chunk_size = utm_conversion_max_chunk_size
+        else:
+            raise RasterUsageException(
+                f'Unknown projection type: {self.projection_type}')
+
+        self.padding = padding
+        self.height_agg_method = height_agg_method
+        self.area_agg_method = area_agg_method
+        self.sig0_agg_method = sig0_agg_method
+        self.interior_water_classes = interior_water_classes
+        self.water_edge_classes = water_edge_classes
+        self.land_edge_classes = land_edge_classes
+        self.dark_water_classes = dark_water_classes
+        self.low_coh_water_classes = low_coh_water_classes
+        self.use_bright_land = use_bright_land
+        self.use_specular_not_intersecting_prior = \
+            use_specular_not_intersecting_prior
+        self.specular_not_intersecting_prior_thresh = \
+            specular_not_intersecting_prior_thresh
+        self.use_all_classes_for_wse = use_all_classes_for_wse
+        self.use_all_classes_for_sig0 = use_all_classes_for_sig0
+
+        self.wse_geo_qual_suspect = wse_geo_qual_suspect
+        self.wse_geo_qual_degraded = wse_geo_qual_degraded
+        self.wse_geo_qual_bad = wse_geo_qual_bad
+        self.area_geo_qual_suspect = area_geo_qual_suspect
+        self.area_geo_qual_degraded = area_geo_qual_degraded
+        self.area_geo_qual_bad = area_geo_qual_bad
+        self.sig0_geo_qual_suspect = sig0_geo_qual_suspect
+        self.sig0_geo_qual_degraded = sig0_geo_qual_degraded
+        self.sig0_geo_qual_bad = sig0_geo_qual_bad
+
+        self.wse_class_qual_suspect = wse_class_qual_suspect
+        self.wse_class_qual_degraded = wse_class_qual_degraded
+        self.wse_class_qual_bad = wse_class_qual_bad
+        self.area_class_qual_suspect = area_class_qual_suspect
+        self.area_class_qual_degraded = area_class_qual_degraded
+        self.area_class_qual_bad = area_class_qual_bad
+        self.sig0_class_qual_suspect = sig0_class_qual_suspect
+        self.sig0_class_qual_degraded = sig0_class_qual_degraded
+        self.sig0_class_qual_bad = sig0_class_qual_bad
+
+        self.sig0_qual_suspect = sig0_qual_suspect
+        self.sig0_qual_degraded = sig0_qual_degraded
+        self.sig0_qual_bad = sig0_qual_bad
+
+        self.num_good_sus_pix_thresh_wse = num_good_sus_pix_thresh_wse
+        self.num_good_sus_pix_thresh_water_area = \
+            num_good_sus_pix_thresh_water_area
+        self.num_good_sus_pix_thresh_sig0 = num_good_sus_pix_thresh_sig0
+
+        self.pixc_water_frac_suspect_thresh = pixc_water_frac_suspect_thresh
+        self.num_wse_pix_suspect_thresh = num_wse_pix_suspect_thresh
+        self.num_water_area_pix_suspect_thresh = \
+            num_water_area_pix_suspect_thresh
+        self.num_sig0_pix_suspect_thresh = num_sig0_pix_suspect_thresh
+        self.near_range_suspect_thresh = near_range_suspect_thresh
+        self.far_range_suspect_thresh = far_range_suspect_thresh
+        self.wse_uncert_suspect_thresh = wse_uncert_suspect_thresh
+        self.water_frac_uncert_suspect_thresh = \
+            water_frac_uncert_suspect_thresh
+        self.sig0_uncert_suspect_thresh = sig0_uncert_suspect_thresh
+
+        self.wse_bad_thresh_min = wse_bad_thresh_min
+        self.wse_bad_thresh_max = wse_bad_thresh_max
+        self.water_frac_bad_thresh_min = water_frac_bad_thresh_min
+        self.water_frac_bad_thresh_max = water_frac_bad_thresh_max
+        self.sig0_bad_thresh_min = sig0_bad_thresh_min
+        self.sig0_bad_thresh_max = sig0_bad_thresh_max
+
+        self.inner_swath_distance_thresh = inner_swath_distance_thresh
+        self.missing_karin_data_time_thresh = missing_karin_data_time_thresh
+
+        self.ice_flag_valid_frac_thresh = ice_flag_valid_frac_thresh
+        self.ice_flag_value_frac_thresh = ice_flag_value_frac_thresh
+
+        self.skip_wse = skip_wse
+        self.skip_area = skip_area
+        self.skip_sig0 = skip_sig0
+
+        self.aggregator_max_chunk_size = aggregator_max_chunk_size
+        self.max_worker_processes = max_worker_processes
+        self.debug_flag = debug_flag
+
+    def rasterize(self, pixc, polygon_points=None, data_centroid=None,
+                  use_improved_geoloc=True):
+        """ Rasterize pixc to raster """
+        LOGGER.info("rasterizing")
+        self.input_crs = raster_crs.wgs84_crs()
+        self.cycle_number = pixc.cycle_number
+        self.pass_number = pixc.pass_number
+        self.scene_number = pixc.scene_number
+        self.time_granule_start = pixc.time_granule_start
+        self.time_granule_end = pixc.time_granule_end
+        self.geospatial_lon_min = pixc.geospatial_lon_min
+        self.geospatial_lon_max = pixc.geospatial_lon_max
+        self.geospatial_lat_min = pixc.geospatial_lat_min
+        self.geospatial_lat_max = pixc.geospatial_lat_max
+        self.left_first_longitude = pixc.left_first_longitude
+        self.left_first_latitude = pixc.left_first_latitude
+        self.left_last_longitude = pixc.left_last_longitude
+        self.left_last_latitude = pixc.left_last_latitude
+        self.right_first_longitude = pixc.right_first_longitude
+        self.right_first_latitude = pixc.right_first_latitude
+        self.right_last_longitude = pixc.right_last_longitude
+        self.right_last_latitude = pixc.right_last_latitude
+
+        self.tile_cycle_numbers = pixc['pixel_cloud']['tile_cycle_number']
+        self.tile_pass_numbers = pixc['pixel_cloud']['tile_pass_number']
+        self.tile_numbers = pixc['pixel_cloud']['tile_tile_number']
+        self.tile_names = pixc['pixel_cloud']['tile_tile_name']
+        self.tile_polarizations = pixc['pixel_cloud']['tile_polarization']
+
+        self.time_coverage_start = products.EMPTY_DATETIME
+        self.time_coverage_end = products.EMPTY_DATETIME
+        self.tai_utc_difference = products.EMPTY_TAI_UTC_DIFF
+        self.leap_second = products.EMPTY_LEAPSEC
+
+        if polygon_points is None:
+            LOGGER.info("creating projection from bounding box")
+            bbox_polygon_points = \
+                [(pixc.geospatial_lat_min, pixc.geospatial_lon_min),
+                 (pixc.geospatial_lat_max, pixc.geospatial_lon_min),
+                 (pixc.geospatial_lat_max, pixc.geospatial_lon_max),
+                 (pixc.geospatial_lat_min, pixc.geospatial_lon_max)]
+            self.create_projection_from_polygon_points(bbox_polygon_points,
+                                                       data_centroid)
+        else:
+            LOGGER.info("creating projection from polygon points")
+            self.create_projection_from_polygon_points(polygon_points,
+                                                       data_centroid)
+
+        # Get pixc classification masks
+        water_classes = np.concatenate((self.interior_water_classes,
+                                        self.water_edge_classes,
+                                        self.dark_water_classes))
+        all_classes = np.concatenate((water_classes, self.land_edge_classes))
+
+        water_classes_mask = pixc.get_mask(water_classes, use_improved_geoloc)
+        all_classes_mask = pixc.get_mask(all_classes, use_improved_geoloc)
+        dark_water_classes_mask = pixc.get_mask(
+            self.dark_water_classes, use_improved_geoloc)
+        low_coh_water_classes_mask = pixc.get_mask(
+            self.low_coh_water_classes, use_improved_geoloc)
+
+        bright_land_pixc_flag = \
+            pixc['pixel_cloud']['bright_land_flag'].filled(0)
+        if not self.use_bright_land:
+            not_bright_land = np.logical_not(bright_land_pixc_flag)
+            water_classes_mask = np.logical_and(
+                water_classes_mask, not_bright_land)
+            all_classes_mask = np.logical_and(
+                all_classes_mask, not_bright_land)
+            dark_water_classes_mask = np.logical_and(
+                dark_water_classes_mask, not_bright_land)
+            low_coh_water_classes_mask = np.logical_and(
+                low_coh_water_classes_mask, not_bright_land)
+
+        # Handle specular ringing
+        # Suspect if intersecting prior water, otherwise degraded
+        specular_ringing_mask = pixc.get_qual_flag_bit(
+            'classification_qual', 'specular_ringing_degraded')
+        no_prior_water = pixc['pixel_cloud']['prior_water_prob'].filled(0) \
+            < self.specular_not_intersecting_prior_thresh
+        specular_intersecting_prior = np.logical_and(
+            specular_ringing_mask, np.logical_not(no_prior_water))
+        specular_not_intersecting_prior = np.logical_and(
+            specular_ringing_mask, no_prior_water)
+        specular_ringing_qual = np.full(
+            specular_ringing_mask.shape, products.QUAL_IND_GOOD)
+        specular_ringing_qual[specular_intersecting_prior] = \
+            products.QUAL_IND_SUSPECT
+        specular_ringing_qual[specular_not_intersecting_prior] = \
+            products.QUAL_IND_DEGRADED
+        suspect_specular_ringing_qual = \
+            products.QUAL_IND_SUSPECT*specular_ringing_mask
+
+        if not self.use_specular_not_intersecting_prior:
+            not_specular_not_intersecting_prior = np.logical_not(
+                specular_not_intersecting_prior)
+            water_classes_mask = np.logical_and(
+                water_classes_mask, not_specular_not_intersecting_prior)
+            all_classes_mask = np.logical_and(
+                all_classes_mask, not_specular_not_intersecting_prior)
+            dark_water_classes_mask = np.logical_and(
+                dark_water_classes_mask, not_specular_not_intersecting_prior)
+            low_coh_water_classes_mask = np.logical_and(
+                low_coh_water_classes_mask,
+                not_specular_not_intersecting_prior)
+
+        # Get pixc summary quality flags
+        LOGGER.info("getting pixc summary quality flags")
+        wse_geo_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'geolocation_qual', self.wse_geo_qual_suspect,
+            self.wse_geo_qual_degraded, self.wse_geo_qual_bad)
+        area_geo_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'geolocation_qual', self.area_geo_qual_suspect,
+            self.area_geo_qual_degraded, self.area_geo_qual_bad)
+        sig0_geo_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'geolocation_qual', self.sig0_geo_qual_suspect,
+            self.sig0_geo_qual_degraded, self.sig0_geo_qual_bad)
+        wse_class_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'classification_qual', self.wse_class_qual_suspect,
+            self.wse_class_qual_degraded, self.wse_class_qual_bad)
+        area_class_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'classification_qual', self.area_class_qual_suspect,
+            self.area_class_qual_degraded, self.area_class_qual_bad)
+        sig0_class_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'classification_qual', self.sig0_class_qual_suspect,
+            self.sig0_class_qual_degraded, self.sig0_class_qual_bad)
+        sig0_qual_pixc_flag = pixc.get_summary_qual_flag(
+            'sig0_qual', self.sig0_qual_suspect,
+            self.sig0_qual_degraded, self.sig0_qual_bad)
+
+        # Get raster mapping
+        empty_product = self.build_product(populate_values=False)
+        if self.projection_type.lower() == 'utm':
+            self.proj_mapping = empty_product.get_raster_mapping(
+                pixc, all_classes_mask, use_improved_geoloc,
+                self.utm_conversion_max_chunk_size)
+        else:
+            self.proj_mapping = empty_product.get_raster_mapping(
+                pixc, all_classes_mask, use_improved_geoloc)
+
+        # Get rasterization masks
+        LOGGER.info('getting rasterization masks for wse/water area/sig0')
+        # WSE: only water classes are good/sus unless use_all_classes
+        #      dark water and low coh water are degraded
+        #      specular ringing quality derived from prior water intersection
+        wse_base_classes_mask = water_classes_mask
+        if self.use_all_classes_for_wse:
+            wse_base_classes_mask = all_classes_mask
+
+        wse_good_sus_classes_mask = np.logical_and.reduce((
+            wse_base_classes_mask,
+            np.logical_not(dark_water_classes_mask),
+            np.logical_not(low_coh_water_classes_mask)))
+        wse_degraded_classes_mask = np.logical_or(
+            dark_water_classes_mask, low_coh_water_classes_mask)
+
+        wse_pixc_mask, wse_raster_mask = self.get_rasterization_masks(
+            wse_good_sus_classes_mask, wse_degraded_classes_mask,
+            (wse_geo_qual_pixc_flag, wse_class_qual_pixc_flag,
+             specular_ringing_qual),
+            self.num_good_sus_pix_thresh_wse)
+
+        # Area: all classes are good/sus
+        #       dark water and low coh water are not degraded
+        #       specular ringing always suspect
+        area_base_classes_mask = all_classes_mask
+        area_good_sus_classes_mask = area_base_classes_mask
+        area_degraded_classes_mask = np.zeros_like(area_good_sus_classes_mask)
+
+        water_area_pixc_mask, water_area_raster_mask = \
+            self.get_rasterization_masks(
+                area_good_sus_classes_mask, area_degraded_classes_mask,
+                (area_geo_qual_pixc_flag, area_class_qual_pixc_flag,
+                 suspect_specular_ringing_qual),
+                self.num_good_sus_pix_thresh_water_area)
+
+        # Sig0: only water classes are good/sus unless use_all_classes
+        #       dark water and low coh water are not degraded
+        #       specular ringing always suspect
+        sig0_base_classes_mask = water_classes_mask
+        if self.use_all_classes_for_sig0:
+            sig0_base_classes_mask = all_classes_mask
+
+        sig0_good_sus_classes_mask = sig0_base_classes_mask
+        sig0_degraded_classes_mask = np.zeros_like(sig0_good_sus_classes_mask)
+
+        sig0_pixc_mask, sig0_raster_mask = self.get_rasterization_masks(
+            sig0_good_sus_classes_mask, sig0_degraded_classes_mask,
+            (sig0_geo_qual_pixc_flag, sig0_class_qual_pixc_flag,
+             sig0_qual_pixc_flag, suspect_specular_ringing_qual),
+            self.num_good_sus_pix_thresh_sig0)
+
+        all_pixc_mask = np.logical_or.reduce((
+            wse_pixc_mask, water_area_pixc_mask, sig0_pixc_mask))
+        all_raster_mask = np.logical_or.reduce((
+            wse_raster_mask, water_area_raster_mask, sig0_raster_mask))
+
+        # Aggregate variables
+        LOGGER.info('aggregating cross track and incidence angle')
+        self.cross_track, self.inc, self.n_other_pix = self.call_aggregator(
+            raster_agg.aggregate_cross_track_and_incidence_angle,
+            pixc['pixel_cloud']['cross_track'], pixc['pixel_cloud']['inc'],
+            all_pixc_mask, mask=all_raster_mask)
+
+        LOGGER.info('aggregating illumination time')
+        self.illumination_time, self.illumination_time_tai = \
+            self.call_aggregator(
+                raster_agg.aggregate_illumination_time,
+                pixc['pixel_cloud']['illumination_time'],
+                pixc['pixel_cloud']['illumination_time_tai'],
+                all_pixc_mask, mask=all_raster_mask)
+
+        LOGGER.info('aggregating latitude and longitude')
+        x_mesh = np.tile(self.x_vec, (self.size_y, 1))
+        y_mesh = np.tile(self.y_vec, (self.size_x, 1)).T
+        if self.projection_type.lower() == 'geo':
+            self.latitude = np.ma.masked_array(
+                y_mesh, mask=np.logical_not(all_raster_mask))
+            self.longitude = np.ma.masked_array(
+                x_mesh, mask=np.logical_not(all_raster_mask))
+        else:
+            self.latitude, self.longitude = self.call_aggregator(
+                partial(raster_agg.aggregate_px_latlon,
+                        crs_wkt=self.output_crs.ExportToWkt()),
+                x_mesh, y_mesh, all_pixc_mask, mask=all_raster_mask)
+
+        if not self.skip_wse:
+            LOGGER.info('aggregating wse corrections')
+            (self.height_cor_xover, self.geoid, self.solid_earth_tide,
+             self.load_tide_fes, self.load_tide_got, self.pole_tide,
+             self.model_dry_tropo_cor, self.model_wet_tropo_cor,
+             self.iono_cor_gim_ka) = self.call_aggregator(
+                 partial(raster_agg.aggregate_wse_corrections,
+                         height_agg_method=self.height_agg_method),
+                 pixc['pixel_cloud']['height_cor_xover'],
+                 pixc['pixel_cloud']['geoid'],
+                 pixc['pixel_cloud']['solid_earth_tide'],
+                 pixc['pixel_cloud']['load_tide_fes'],
+                 pixc['pixel_cloud']['load_tide_got'],
+                 pixc['pixel_cloud']['pole_tide'],
+                 pixc['pixel_cloud']['model_dry_tropo_cor'],
+                 pixc['pixel_cloud']['model_wet_tropo_cor'],
+                 pixc['pixel_cloud']['iono_cor_gim_ka'],
+                 pixc['pixel_cloud']['dheight_dphase'],
+                 pixc['pixel_cloud']['phase_noise_std'],
+                 wse_pixc_mask, mask=wse_raster_mask)
+
+            LOGGER.info('flattening interferogram')
+            tvp_plus_y_antenna_xyz = (pixc['tvp']['plus_y_antenna_x'],
+                                      pixc['tvp']['plus_y_antenna_y'],
+                                      pixc['tvp']['plus_y_antenna_z'])
+            tvp_minus_y_antenna_xyz = (pixc['tvp']['minus_y_antenna_x'],
+                                       pixc['tvp']['minus_y_antenna_y'],
+                                       pixc['tvp']['minus_y_antenna_z'])
+
+            if use_improved_geoloc:
+                # Flatten ifgram with improved geoloc and height
+                target_xyz = raster_crs.llh2xyz((
+                    np.deg2rad(pixc['pixel_cloud']['improved_latitude']),
+                    np.deg2rad(pixc['pixel_cloud']['improved_longitude']),
+                    pixc['pixel_cloud']['improved_height']))
+            else:
+                # Flatten ifgram with original geoloc and improved height
+                target_xyz = raster_crs.llh2xyz((
+                    np.deg2rad(pixc['pixel_cloud']['latitude']),
+                    np.deg2rad(pixc['pixel_cloud']['longitude']),
+                    pixc['pixel_cloud']['improved_height']))
+
+            if len(pixc['tvp']['time']) > 0:
+                line_idx = pixc['pixel_cloud']['pixc_line_index']
+                tile_idx = pixc['pixel_cloud']['pixc_line_to_tile'][line_idx]
+                flat_ifgram = ag.flatten_interferogram(
+                    pixc['pixel_cloud']['interferogram'],
+                    tvp_plus_y_antenna_xyz, tvp_minus_y_antenna_xyz,
+                    target_xyz, ag.get_sensor_index(pixc),
+                    pixc['pixel_cloud']['tile_wavelength'][tile_idx])
+            else:
+                LOGGER.warning('Unable to flatten interferogram: Empty TVP...')
+                flat_ifgram = pixc['pixel_cloud']['interferogram']
+
+            LOGGER.info('aggregating height')
+            height, self.wse_u = self.call_aggregator(
+                partial(raster_agg.aggregate_height,
+                        looks_to_efflooks=1,
+                        height_agg_method=self.height_agg_method),
+                pixc['pixel_cloud']['height'],
+                pixc['pixel_cloud']['eff_num_rare_looks'],
+                pixc['pixel_cloud']['eff_num_medium_looks'],
+                pixc['pixel_cloud']['power_plus_y'],
+                pixc['pixel_cloud']['power_minus_y'],
+                pixc['pixel_cloud']['dheight_dphase'],
+                pixc['pixel_cloud']['dlatitude_dphase'],
+                pixc['pixel_cloud']['dlongitude_dphase'],
+                pixc['pixel_cloud']['phase_noise_std'], flat_ifgram,
+                wse_pixc_mask, mask=wse_raster_mask)
+
+            LOGGER.info('applying wse corrections')
+            self.wse = raster_agg.apply_wse_corrections(
+                height, self.geoid, self.solid_earth_tide,
+                self.load_tide_fes, self.pole_tide)
+
+            LOGGER.info('aggregating wse qual')
+            (self.wse_qual, self.wse_qual_bitwise,
+             self.n_wse_pix) = self.call_aggregator(
+                 partial(raster_agg.aggregate_wse_qual,
+                         wse_uncert_suspect_thresh=
+                             self.wse_uncert_suspect_thresh,
+                         num_wse_pix_suspect_thresh=
+                             self.num_wse_pix_suspect_thresh,
+                         near_range_suspect_thresh=
+                             self.near_range_suspect_thresh,
+                         far_range_suspect_thresh=
+                             self.far_range_suspect_thresh,
+                         wse_bad_thresh_min=self.wse_bad_thresh_min,
+                         wse_bad_thresh_max=self.wse_bad_thresh_max),
+                 self.wse, self.wse_u, self.cross_track,
+                 wse_class_qual_pixc_flag, wse_geo_qual_pixc_flag,
+                 bright_land_pixc_flag, dark_water_classes_mask,
+                 low_coh_water_classes_mask, specular_ringing_qual,
+                 wse_pixc_mask, mask=wse_raster_mask)
+
+            LOGGER.info('aggregating layover impact')
+            self.layover_impact = self.call_aggregator(
+                partial(raster_agg.aggregate_layover_impact,
+                        height_agg_method=self.height_agg_method),
+                pixc['pixel_cloud']['layover_impact'],
+                pixc['pixel_cloud']['dheight_dphase'],
+                pixc['pixel_cloud']['phase_noise_std'],
+                wse_pixc_mask, mask=wse_raster_mask)
+
+        if not self.skip_area:
+            LOGGER.info('aggregating water area')
+            (self.water_area, self.water_area_u, self.water_frac,
+             self.water_frac_u) = self.call_aggregator(
+                 partial(raster_agg.aggregate_water_area,
+                         projection_type=self.projection_type,
+                         resolution=self.resolution,
+                         interior_water_klasses=self.interior_water_classes,
+                         water_edge_klasses=self.water_edge_classes,
+                         land_edge_klasses=self.land_edge_classes,
+                         dark_water_klasses=self.dark_water_classes,
+                         area_agg_method=self.area_agg_method),
+                 pixc['pixel_cloud']['pixel_area'],
+                 pixc['pixel_cloud']['water_frac'],
+                 pixc['pixel_cloud']['water_frac_uncert'],
+                 pixc['pixel_cloud']['darea_dheight'],
+                 pixc['pixel_cloud']['false_detection_rate'],
+                 pixc['pixel_cloud']['missed_detection_rate'],
+                 pixc['pixel_cloud']['classification'], self.latitude,
+                 water_area_pixc_mask, mask=water_area_raster_mask)
+
+            LOGGER.info('aggregating water area qual')
+            (self.water_area_qual, self.water_area_qual_bitwise,
+             self.n_water_area_pix) = self.call_aggregator(
+                 partial(raster_agg.aggregate_water_area_qual,
+                         pixc_water_frac_suspect_thresh=
+                             self.pixc_water_frac_suspect_thresh,
+                         water_frac_uncert_suspect_thresh=
+                             self.water_frac_uncert_suspect_thresh,
+                         num_water_area_pix_suspect_thresh=
+                             self.num_water_area_pix_suspect_thresh,
+                         near_range_suspect_thresh=
+                             self.near_range_suspect_thresh,
+                         far_range_suspect_thresh=
+                             self.far_range_suspect_thresh,
+                         water_frac_bad_thresh_min=
+                             self.water_frac_bad_thresh_min,
+                         water_frac_bad_thresh_max=
+                             self.water_frac_bad_thresh_max),
+                 self.water_frac, self.water_frac_u, self.cross_track,
+                 area_class_qual_pixc_flag, area_geo_qual_pixc_flag,
+                 bright_land_pixc_flag, dark_water_classes_mask,
+                 low_coh_water_classes_mask, specular_ringing_qual,
+                 pixc['pixel_cloud']['water_frac'],
+                 water_area_pixc_mask, mask=water_area_raster_mask)
+
+            LOGGER.info('aggregating dark water fraction')
+            dark_area = self.call_aggregator(
+                partial(raster_agg.aggregate_dark_area,
+                        interior_water_klasses=self.interior_water_classes,
+                        water_edge_klasses=self.water_edge_classes,
+                        land_edge_klasses=self.land_edge_classes,
+                        dark_water_klasses=self.dark_water_classes,
+                        area_agg_method=self.area_agg_method),
+                pixc['pixel_cloud']['classification'],
+                pixc['pixel_cloud']['pixel_area'],
+                pixc['pixel_cloud']['water_frac'],
+                water_area_pixc_mask, mask=water_area_raster_mask)
+            self.dark_frac = dark_area / self.water_area
+
+            LOGGER.info('aggregating water edge fraction')
+            edge_area = self.call_aggregator(
+                partial(raster_agg.aggregate_edge_area,
+                        interior_water_klasses=self.interior_water_classes,
+                        water_edge_klasses=self.water_edge_classes,
+                        land_edge_klasses=self.land_edge_classes,
+                        dark_water_klasses=self.dark_water_classes,
+                        area_agg_method=self.area_agg_method),
+                pixc['pixel_cloud']['classification'],
+                pixc['pixel_cloud']['pixel_area'],
+                pixc['pixel_cloud']['water_frac'],
+                water_area_pixc_mask, mask=water_area_raster_mask)
+            self.edge_frac = edge_area / self.water_area
+
+        if not self.skip_sig0:
+            LOGGER.info('aggregating sigma0 corrections')
+            self.sig0_cor_atmos_model = self.call_aggregator(
+                raster_agg.aggregate_sig0_corrections,
+                pixc['pixel_cloud']['sig0_cor_atmos_model'],
+                sig0_pixc_mask, mask=sig0_raster_mask)
+
+            LOGGER.info('aggregating sigma0')
+            self.sig0, self.sig0_u = self.call_aggregator(
+                partial(raster_agg.aggregate_sig0,
+                        sig0_agg_method=self.sig0_agg_method),
+                pixc['pixel_cloud']['sig0'],
+                pixc['pixel_cloud']['sig0_uncert'],
+                sig0_pixc_mask, mask=sig0_raster_mask)
+
+            LOGGER.info('aggregating sigma0 qual')
+            (self.sig0_qual, self.sig0_qual_bitwise,
+             self.n_sig0_pix) = self.call_aggregator(
+                 partial(raster_agg.aggregate_sig0_qual,
+                         sig0_uncert_suspect_thresh=
+                             self.sig0_uncert_suspect_thresh,
+                         num_sig0_pix_suspect_thresh=
+                             self.num_sig0_pix_suspect_thresh,
+                         near_range_suspect_thresh=
+                             self.near_range_suspect_thresh,
+                         far_range_suspect_thresh=
+                             self.far_range_suspect_thresh,
+                         sig0_bad_thresh_min=self.sig0_bad_thresh_min,
+                         sig0_bad_thresh_max=self.sig0_bad_thresh_max),
+                 self.sig0, self.sig0_u, self.cross_track, sig0_qual_pixc_flag,
+                 sig0_class_qual_pixc_flag, sig0_geo_qual_pixc_flag,
+                 bright_land_pixc_flag, dark_water_classes_mask,
+                 low_coh_water_classes_mask, specular_ringing_qual,
+                 sig0_pixc_mask, mask=sig0_raster_mask)
+
+        if self.debug_flag:
+            LOGGER.info('aggregating classification')
+            self.classification = self.call_aggregator(
+                raster_agg.aggregate_classification,
+                pixc['pixel_cloud']['classification'],
+                all_pixc_mask, mask=all_raster_mask)
+
+        LOGGER.info('aggregating ice flags')
+        self.ice_clim_flag = self.call_aggregator(
+            partial(raster_agg.aggregate_ice_flag,
+                    ice_flag_valid_frac_thresh=self.ice_flag_valid_frac_thresh,
+                    ice_flag_value_frac_thresh=self.ice_flag_value_frac_thresh),
+            pixc['pixel_cloud']['ice_clim_flag'],
+            all_pixc_mask, mask=all_raster_mask)
+
+        self.ice_dyn_flag = self.call_aggregator(
+            partial(raster_agg.aggregate_ice_flag,
+                    ice_flag_valid_frac_thresh=self.ice_flag_valid_frac_thresh,
+                    ice_flag_value_frac_thresh=self.ice_flag_value_frac_thresh),
+            pixc['pixel_cloud']['ice_dyn_flag'],
+            all_pixc_mask, mask=all_raster_mask)
+
+        LOGGER.info("flagging missing karin data")
+        self.flag_missing_karin_data(pixc)
+
+        LOGGER.info("flagging inner swath")
+        self.flag_inner_swath(pixc)
+
+        # Update time coverage, tai/utc difference and leap seconds
+        if not np.all(self.illumination_time.mask):
+            start_illumination_time = np.min(self.illumination_time)
+            end_illumination_time = np.max(self.illumination_time)
+            start_time = datetime.datetime.fromtimestamp(
+                (products.SWOT_EPOCH - products.UNIX_EPOCH).total_seconds()
+                + start_illumination_time, datetime.UTC)
+            end_time = datetime.datetime.fromtimestamp(
+                (products.SWOT_EPOCH - products.UNIX_EPOCH).total_seconds()
+                + end_illumination_time, datetime.UTC)
+            self.time_coverage_start = start_time.strftime(
+                products.DATETIME_FORMAT_STR)
+            self.time_coverage_end = end_time.strftime(
+                products.DATETIME_FORMAT_STR)
+
+            min_illumination_time_idx = np.unravel_index(
+                np.argmin(self.illumination_time),
+                self.illumination_time.shape)
+            self.tai_utc_difference = \
+                self.illumination_time_tai[min_illumination_time_idx] \
+                - self.illumination_time[min_illumination_time_idx]
+
+            if pixc.leap_second != products.EMPTY_LEAPSEC:
+                leap_second_time = datetime.datetime.strptime(
+                    pixc.leap_second, products.LEAPSEC_FORMAT_STR).replace(
+                        tzinfo=datetime.UTC)
+                if start_time <= leap_second_time <= end_time:
+                    self.leap_second = pixc.leap_second
+
+        LOGGER.info("building product")
+        return self.build_product(polygon_points=polygon_points)
+
+    def create_projection_from_polygon_points(self, polygon_points,
+                                              data_centroid=None):
+        """ Create projection given points defining a bounding polygon"""
+        if self.projection_type.lower() == 'geo':
+            # Set output crs
+            self.output_crs = raster_crs.wgs84_crs()
+
+            # Handle longitude wrap
+            poly_edge_x = raster_crs.shift_wrapped_longitude(
+                [point[1] for point in polygon_points])
+            poly_edge_y = [point[0] for point in polygon_points]
+            proj_center_x = 0
+            proj_center_y = 0
+        elif self.projection_type.lower() == 'utm':
+            # Set output crs
+            if data_centroid is None:
+                crs_poly = Polygon(
+                    [[point[1], point[0]] for point in polygon_points])
+                self.output_crs, utm_zone, mgrs_band = \
+                    raster_crs.utm_crs_from_polygon(
+                        crs_poly, self.utm_zone_adjust, self.mgrs_band_adjust)
+            else:
+                self.output_crs, utm_zone, mgrs_band = \
+                    raster_crs.utm_crs_from_point(
+                        data_centroid, self.utm_zone_adjust,
+                        self.mgrs_band_adjust)
+
+            self.utm_zone = np.short(utm_zone)
+            self.utm_hemisphere = raster_crs.hemisphere_from_mgrs_band(
+                mgrs_band)
+            self.mgrs_band = mgrs_band
+
+            # Transform to UTM
+            transf = osr.CoordinateTransformation(self.input_crs,
+                                                  self.output_crs)
+            polygon_points = [(transf.TransformPoint(point[0], point[1])[:2])
+                              for point in polygon_points]
+            poly_edge_y = [point[1] for point in polygon_points]
+            poly_edge_x = [point[0] for point in polygon_points]
+            proj_center_x = self.output_crs.GetProjParm('false_easting')
+            proj_center_y = self.output_crs.GetProjParm('false_northing')
+        else:
+            raise RasterUsageException(
+                f'Unknown projection type: {self.projection_type}')
+
+        # Get the coordinate limits
+        x_min = np.min(poly_edge_x)
+        x_max = np.max(poly_edge_x)
+        y_min = np.min(poly_edge_y)
+        y_max = np.max(poly_edge_y)
+
+        # Round limits to the nearest bin (centered at proj center with pad)
+        x_min = int((round((x_min - proj_center_x) / self.resolution))
+                    - self.padding) * self.resolution + proj_center_x
+        x_max = int((round((x_max - proj_center_x) / self.resolution))
+                    + self.padding) * self.resolution + proj_center_x
+        y_min = int((round((y_min - proj_center_y) / self.resolution))
+                    - self.padding) * self.resolution + proj_center_y
+        y_max = int((round((y_max - proj_center_y) / self.resolution))
+                    + self.padding) * self.resolution + proj_center_y
+
+        self.size_x = int(round((x_max - x_min) / self.resolution)) + 1
+        self.size_y = int(round((y_max - y_min) / self.resolution)) + 1
+
+        # Wrap longitude to between -180 to 180 degrees longitude if lat/lon
+        if self.projection_type.lower() == 'geo':
+            self.x_min = raster_crs.lon_360to180(x_min)
+            self.x_max = raster_crs.lon_360to180(x_max)
+            self.x_vec = raster_crs.lon_360to180(
+                np.linspace(x_min, x_max, self.size_x))
+        else:
+            self.x_min = x_min
+            self.x_max = x_max
+            self.x_vec = np.linspace(x_min, x_max, self.size_x)
+
+        self.y_min = y_min
+        self.y_max = y_max
+        self.y_vec = np.linspace(y_min, y_max, self.size_y)
+
+        LOGGER.info({'proj': self.output_crs.ExportToWkt(),
+                     'res': self.resolution,
+                     'x_min': self.x_min,
+                     'x_max': self.x_max,
+                     'size_x': self.size_x,
+                     'y_min': self.y_min,
+                     'y_max': self.y_max,
+                     'size_y': self.size_y})
+
+    def get_rasterization_masks(
+            self, good_sus_classes_mask, degraded_classes_mask,
+            pixc_summary_qual_flags, num_good_sus_pix_thresh):
+        """ Get masks of pixels to rasterize """
+        common_qual_flag = np.maximum.reduce((pixc_summary_qual_flags))
+        good_qual_mask = [x == products.QUAL_IND_GOOD
+                          for x in common_qual_flag]
+        sus_qual_mask = [x == products.QUAL_IND_SUSPECT
+                         for x in common_qual_flag]
+        deg_qual_mask = [x == products.QUAL_IND_DEGRADED
+                         for x in common_qual_flag]
+
+        good_sus_mask = np.logical_and(
+            good_sus_classes_mask,
+            np.logical_or(good_qual_mask, sus_qual_mask))
+
+        good_sus_degraded_classes_mask = np.logical_or(
+            good_sus_classes_mask, degraded_classes_mask)
+        good_sus_degraded_mask = np.logical_and(
+            good_sus_degraded_classes_mask,
+            np.logical_or.reduce((good_qual_mask, sus_qual_mask,
+                                  deg_qual_mask)))
+
+        pixc_mask = np.ma.zeros(good_sus_mask.shape, dtype=bool)
+        raster_mask = np.ma.zeros((self.size_y, self.size_x), dtype=bool)
+
+        for i in range(0, self.size_y):
+            for j in range(0, self.size_x):
+                mask = good_sus_mask[self.proj_mapping[i][j]]
+                if np.sum(mask) < num_good_sus_pix_thresh:
+                    mask = good_sus_degraded_mask[self.proj_mapping[i][j]]
+                if np.any(mask):
+                    mapping_idxs = np.array(self.proj_mapping[i][j])[mask]
+                    pixc_mask[mapping_idxs] = True
+                    raster_mask[i][j] = True
+
+        return pixc_mask, raster_mask
+
+    def call_aggregator(self, agg_fn, *args, mask=None):
+        """ Calls aggregator function with iterable arguments """
+        def get_agg_arg(arg, mask, chunk_size=None):
+            """ Get generator of an aggregator input argument,
+                with chunking """
+            if arg.shape == (self.size_y, self.size_x):
+                if chunk_size is None:
+                    return (el for el in arg[mask])
+                return (list(chunk)
+                        for chunk in raster_agg.chunk_it(
+                                arg[mask], chunk_size))
+
+            compressed_mapping = compress(
+                chain.from_iterable(self.proj_mapping), mask.flatten())
+            if chunk_size is None:
+                return (arg[inds] for inds in compressed_mapping)
+            return ([arg[inds] for inds in chunk]
+                    for chunk in raster_agg.chunk_it(
+                            compressed_mapping, chunk_size))
+
+        def get_agg_output(result, mask, fill_value=np.nan):
+            """ Get aggregator output on raster grid, with fill_value """
+            out = np.ma.masked_array(
+                np.full((self.size_y, self.size_x), fill_value), fill_value=0)
+            out[mask] = result
+            return np.ma.fix_invalid(out)
+
+        # Call aggregator with multiprocessing if commanded
+        if self.max_worker_processes > 1:
+            chunk_size = int(max(1, min(
+                np.ceil(np.sum(mask) / (self.max_worker_processes*4)),
+                self.aggregator_max_chunk_size)))
+            _agg_fn = partial(raster_agg.fn_map, agg_fn)
+            with multiprocessing.get_context('spawn').Pool(
+                    processes=self.max_worker_processes) as pool:
+                result_chunks = pool.imap(
+                    _agg_fn,
+                    zip(*(get_agg_arg(arg, mask, chunk_size) for arg in args)))
+                results = list(chain.from_iterable(result_chunks))
+        else:
+            _agg_fn = partial(raster_agg.fn_star, agg_fn)
+            results = [_agg_fn(arglist) for arglist
+                       in zip(*(get_agg_arg(arg, mask) for arg in args))]
+
+        # Call aggregator with empty inputs to get fill values
+        empty_results = agg_fn(*[[]]*len(args))
+        if not results:
+            results = [empty_results]
+
+        # Reshape results
+        if isinstance(empty_results, collections.abc.Iterable):
+            return tuple(get_agg_output(result, mask, empty_result)
+                         for result, empty_result in zip(zip(*results),
+                                                         empty_results))
+        return get_agg_output(results, mask, empty_results)
+
+    def flag_missing_karin_data(self, pixc):
+        """ Flag missing karin data """
+        # Define helper functions
+        def _group_by_diff(data, diff, key=None):
+            """ Split dataset into groups based on whether the key
+                (default=data) has a jump greater than a provided
+                difference """
+            if key is None:
+                key = data
+
+            split_idxs = [i+1 for x, y, i in zip(
+                key[:-1], key[1:], range(len(key)))
+                          if abs(y-x) > diff]
+            split_idxs = [0] + split_idxs + [len(key)]
+            groups = [data[i:j] for i, j in zip(
+                split_idxs[:-1], split_idxs[1:])]
+            idxs = [np.arange(i, j) for i, j in zip(
+                split_idxs[:-1], split_idxs[1:])]
+            return zip(groups, idxs)
+
+        def _polygons_points_to_polygons(polygons_points):
+            """ Create list of polygons from list of polygons points """
+            polys = []
+            for this_polygon_points in polygons_points:
+                # If polygon points are in geodetic coordinates, swap lat/lon
+                if self.projection_type.lower() == 'geo':
+                    this_poly = Polygon([[point[1], point[0]]
+                                         for point in this_polygon_points])
+                else:
+                    this_poly = Polygon(this_polygon_points)
+
+                polys.append(this_poly)
+            return polys
+
+        # Create outside data window and extant data polygons
+        extant_data_polygons_points = []
+        outside_data_window_polygons_points = []
+
+        pixc_line_tile_idx = pixc['pixel_cloud']['pixc_line_to_tile']
+        pixc_line_swath_side = pixc['pixel_cloud']['tile_swath_side'][
+            pixc_line_tile_idx]
+        pixc_line_qual_large_karin_gap = pixc.get_qual_flag_bit(
+            'pixc_line_qual', 'large_karin_gap')
+        pixc_line_qual_not_in_tile = pixc.get_qual_flag_bit(
+            'pixc_line_qual', 'not_in_tile')
+
+        # Handle the different sides separately
+        for this_side in ['L', 'R']:
+            side_mask = np.char.upper(pixc_line_swath_side) == this_side
+            side_tvp_idx = pixc['pixel_cloud']['pixc_line_to_tvp'][
+                side_mask].astype(int)
+
+            side_data_window_first_cross_track = pixc['pixel_cloud'][
+                'data_window_first_cross_track'][side_mask]
+            side_data_window_last_cross_track = pixc['pixel_cloud'][
+                'data_window_last_cross_track'][side_mask]
+
+            # Fill/clip data window cross track values to 0, max_extent
+            if this_side == 'L':
+                max_extent = -products.POLYGON_EXTENT_DIST
+                side_data_window_first_cross_track = np.clip(
+                    side_data_window_first_cross_track.filled(0),
+                    max_extent, 0)
+                side_data_window_last_cross_track = np.clip(
+                    side_data_window_last_cross_track.filled(max_extent),
+                    max_extent, 0)
+            else:
+                max_extent = products.POLYGON_EXTENT_DIST
+                side_data_window_first_cross_track = np.clip(
+                    side_data_window_first_cross_track.filled(0),
+                    0, max_extent)
+                side_data_window_last_cross_track = np.clip(
+                    side_data_window_last_cross_track.filled(max_extent),
+                    0, max_extent)
+
+            # Get mask of extant data on this side
+            side_extant_data_mask = np.logical_not(np.logical_or(
+                pixc_line_qual_large_karin_gap[side_mask],
+                pixc_line_qual_not_in_tile[side_mask]))
+
+            for k, g in groupby(enumerate(side_extant_data_mask),
+                                lambda x: x[1]):
+                if k:
+                    group_line_idxs = [idx for idx, _ in g]
+                    group_tvp_idx = side_tvp_idx[group_line_idxs]
+                    group_times = pixc['tvp']['time'][group_tvp_idx]
+                    for line_idxs, _ in _group_by_diff(
+                            group_line_idxs,
+                            self.missing_karin_data_time_thresh,
+                            key=group_times):
+                        tvp_idxs = side_tvp_idx[line_idxs]
+                        group_tvp_xyz = np.row_stack((
+                            pixc['tvp']['x'][tvp_idxs],
+                            pixc['tvp']['y'][tvp_idxs],
+                            pixc['tvp']['z'][tvp_idxs]))
+                        group_tvp_velocity_heading = \
+                            pixc['tvp']['velocity_heading'][tvp_idxs]
+                        group_data_window_first_cross_track = \
+                            side_data_window_first_cross_track[line_idxs]
+                        group_data_window_last_cross_track = \
+                            side_data_window_last_cross_track[line_idxs]
+
+                        # Get extant data polygon points and add to list
+                        extant_data_polygons_points.append(
+                            self.get_swath_polygon_points_from_tvp(
+                                group_tvp_xyz,
+                                group_tvp_velocity_heading,
+                                left_crosstrack_dist=np.minimum(
+                                    group_data_window_first_cross_track,
+                                    group_data_window_last_cross_track),
+                                right_crosstrack_dist=np.maximum(
+                                    group_data_window_first_cross_track,
+                                    group_data_window_last_cross_track)))
+
+                        # Get outside data window polygon points
+                        # (inside and outside) and add to list
+                        outside_data_window_polygons_points.append(
+                            self.get_swath_polygon_points_from_tvp(
+                                group_tvp_xyz,
+                                group_tvp_velocity_heading,
+                                left_crosstrack_dist=np.minimum(
+                                    0, group_data_window_first_cross_track),
+                                right_crosstrack_dist=np.maximum(
+                                    0, group_data_window_first_cross_track)))
+
+                        outside_data_window_polygons_points.append(
+                            self.get_swath_polygon_points_from_tvp(
+                                group_tvp_xyz,
+                                group_tvp_velocity_heading,
+                                left_crosstrack_dist=np.minimum(
+                                    group_data_window_last_cross_track,
+                                    max_extent),
+                                right_crosstrack_dist=np.maximum(
+                                    group_data_window_last_cross_track,
+                                    max_extent)))
+
+        # Create polygons from points
+        extant_data_polys = _polygons_points_to_polygons(
+            extant_data_polygons_points)
+        outside_data_window_polys = _polygons_points_to_polygons(
+            outside_data_window_polygons_points)
+
+        # Handle longitude wrap
+        x_max = self.x_max
+        if self.projection_type.lower() == 'geo' and self.x_min > x_max:
+            x_max = x_max + 360
+            for i, poly in enumerate(extant_data_polys):
+                poly = raster_crs.shift_wrapped_longitude_polygon(poly)
+                (_, _, max_x, _) = poly.bounds
+                if max_x < self.x_min:
+                    poly = affinity.translate(poly, xoff=360)
+                    extant_data_polys[i] = poly
+
+            for i, poly in enumerate(outside_data_window_polys):
+                poly = raster_crs.shift_wrapped_longitude_polygon(poly)
+                (_, _, max_x, _) = poly.bounds
+                if max_x < self.x_min:
+                    poly = affinity.translate(poly, xoff=360)
+                    outside_data_window_polys[i] = poly
+
+        # Create the raster transform from the scene bounds (no wrap)
+        raster_transform = rasterio.transform.from_bounds(
+                self.x_min, self.y_min, x_max, self.y_max, self.size_x,
+                self.size_y)
+
+        # Burn the polygons to the missing data mask
+        if len(extant_data_polys) > 0:
+            missing_data_mask = np.flipud(rasterio.features.geometry_mask(
+                extant_data_polys, out_shape=(self.size_y, self.size_x),
+                transform=raster_transform, all_touched=True))
+        else:
+            missing_data_mask = np.ones(
+                (self.size_y, self.size_x), dtype=bool)
+
+        # Burn the polygons to the outside data window mask
+        if len(outside_data_window_polys) > 0:
+            outside_data_window_mask = np.flipud(
+                rasterio.features.geometry_mask(
+                    outside_data_window_polys,
+                    out_shape=(self.size_y, self.size_x),
+                    transform=raster_transform, all_touched=True, invert=True))
+        else:
+            outside_data_window_mask = np.ones(
+                (self.size_y, self.size_x), dtype=bool)
+
+        # Mask the masks by each other to have correct edge behavior
+        outside_data_window_mask[np.logical_not(missing_data_mask)] = False
+        missing_data_mask[outside_data_window_mask] = False
+
+        # Mask the datasets and flag
+        if not self.skip_wse:
+            wse_missing_data_mask = np.logical_and(
+                self.wse.mask, missing_data_mask)
+            wse_outside_data_window_mask = np.logical_and(
+                self.wse.mask, outside_data_window_mask)
+            self.wse_qual_bitwise[wse_missing_data_mask] += \
+                products.QUAL_IND_MISSING_KARIN_DATA
+            self.wse_qual_bitwise[wse_outside_data_window_mask] += \
+                products.QUAL_IND_OUTSIDE_DATA_WINDOW
+        if not self.skip_area:
+            water_area_missing_data_mask = np.logical_and(
+                self.water_area.mask, missing_data_mask)
+            water_area_outside_data_window_mask = np.logical_and(
+                self.water_area.mask, outside_data_window_mask)
+            self.water_area_qual_bitwise[water_area_missing_data_mask] += \
+                products.QUAL_IND_MISSING_KARIN_DATA
+            self.water_area_qual_bitwise[
+                water_area_outside_data_window_mask] += \
+                    products.QUAL_IND_OUTSIDE_DATA_WINDOW
+        if not self.skip_sig0:
+            sig0_missing_data_mask = np.logical_and(
+                self.sig0.mask, missing_data_mask)
+            sig0_outside_data_window_mask = np.logical_and(
+                self.sig0.mask, outside_data_window_mask)
+            self.sig0_qual_bitwise[sig0_missing_data_mask] += \
+                products.QUAL_IND_MISSING_KARIN_DATA
+            self.sig0_qual_bitwise[sig0_outside_data_window_mask] += \
+                products.QUAL_IND_OUTSIDE_DATA_WINDOW
+
+    def flag_inner_swath(self, pixc):
+        """ Flag inner swath """
+        # Create polygon for inner swath area (full swath)
+
+        if len(pixc['tvp']['time']) > 0:
+            tvp_velocity_heading = pixc['tvp']['velocity_heading']
+            tvp_xyz = np.row_stack((
+                pixc['tvp']['x'], pixc['tvp']['y'], pixc['tvp']['z']))
+
+            inner_swath_polygon_points = \
+                self.get_swath_polygon_points_from_tvp(
+                    tvp_xyz, tvp_velocity_heading,
+                    left_crosstrack_dist=self.inner_swath_distance_thresh,
+                    right_crosstrack_dist=-self.inner_swath_distance_thresh,
+                    alongtrack_start_buffer_dist=products.POLYGON_EXTENT_DIST,
+                    alongtrack_end_buffer_dist=products.POLYGON_EXTENT_DIST)
+
+            # If polygon points are in geodetic coordinates, swap lat/lon
+            if self.projection_type.lower() == 'geo':
+                poly = Polygon([[point[1], point[0]]
+                                for point in inner_swath_polygon_points])
+            else:
+                poly = Polygon(inner_swath_polygon_points)
+
+            # Handle longitude wrap
+            x_max = self.x_max
+            if self.projection_type.lower() == 'geo' and self.x_min > x_max:
+                x_max = x_max + 360
+                poly = raster_crs.shift_wrapped_longitude_polygon(poly)
+                (_, _, max_x, _) = poly.bounds
+                if max_x < self.x_min:
+                    poly = affinity.translate(poly, xoff=360)
+
+            raster_transform = rasterio.transform.from_bounds(
+                self.x_min, self.y_min, x_max, self.y_max, self.size_x,
+                self.size_y)
+            mask = np.flipud(rasterio.features.geometry_mask(
+                [poly], out_shape=(self.size_y, self.size_x),
+                transform=raster_transform, all_touched=True, invert=True))
+        else:
+            mask = np.zeros((self.size_y, self.size_x), dtype=bool)
+
+        # Mask the datasets and flag
+        if not self.skip_wse:
+            wse_mask = np.logical_and(self.wse.mask, mask)
+            self.wse_qual_bitwise[wse_mask] += \
+                products.QUAL_IND_INNER_SWATH
+        if not self.skip_area:
+            water_area_mask = np.logical_and(self.water_area.mask, mask)
+            self.water_area_qual_bitwise[water_area_mask] += \
+                products.QUAL_IND_INNER_SWATH
+        if not self.skip_sig0:
+            sig0_mask = np.logical_and(self.sig0.mask, mask)
+            self.sig0_qual_bitwise[sig0_mask] += \
+                products.QUAL_IND_INNER_SWATH
+
+    def get_swath_polygon_points_from_tvp(
+            self, sc_xyz, sc_velocity_heading,
+            left_crosstrack_dist=products.POLYGON_EXTENT_DIST,
+            right_crosstrack_dist=products.POLYGON_EXTENT_DIST,
+            alongtrack_start_buffer_dist=None, alongtrack_end_buffer_dist=None,
+            downsample_rate=None):
+        """ Get swath polygon points from tvp points """
+        # If either crosstrack dist is a single value, extend it
+        if not isinstance(left_crosstrack_dist, (list, np.ndarray)):
+            left_crosstrack_dist = np.full(
+                len(sc_velocity_heading), left_crosstrack_dist)
+
+        if not isinstance(right_crosstrack_dist, (list, np.ndarray)):
+            right_crosstrack_dist = np.full(
+                len(sc_velocity_heading), right_crosstrack_dist)
+
+        # If there is only one line, repeat it to make a polygon
+        if len(sc_velocity_heading) == 1:
+            sc_xyz = np.column_stack((sc_xyz, sc_xyz))
+            sc_velocity_heading = np.append(
+                sc_velocity_heading, sc_velocity_heading)
+            left_crosstrack_dist = np.append(
+                left_crosstrack_dist, left_crosstrack_dist)
+            right_crosstrack_dist = np.append(
+                right_crosstrack_dist, right_crosstrack_dist)
+
+        transf = osr.CoordinateTransformation(self.input_crs, self.output_crs)
+
+        if downsample_rate is not None:
+            idx_vec = np.arange(0, sc_xyz.shape[1], downsample_rate)
+            if idx_vec[-1] != sc_xyz.shape[1]-1:
+                idx_vec = np.append(idx_vec, sc_xyz.shape[1]-1)
+        else:
+            idx_vec = np.arange(sc_xyz.shape[1])
+
+        crosstrack_angle = np.deg2rad(
+            np.mod(sc_velocity_heading+90, 360))
+        crosstrack_dists = [left_crosstrack_dist, right_crosstrack_dist]
+
+        polygon = []
+        for polygon_side in [0, 1]:
+            crosstrack_dist = crosstrack_dists[polygon_side]
+            this_side_polygon_points = []
+            for idx in idx_vec:
+                sc_llh = raster_crs.xyz2llh(sc_xyz[:, idx])
+                this_side_ll = raster_crs.terminal_loc_spherical(
+                    sc_llh[0], sc_llh[1], crosstrack_dist[idx],
+                    crosstrack_angle[idx])
+                this_side_points_deg = [[np.rad2deg(this_side_ll[0]),
+                                         np.rad2deg(this_side_ll[1]),
+                                         sc_llh[2]]]
+
+                if idx == 0 and alongtrack_start_buffer_dist is not None:
+                    this_side_ll_buffer = raster_crs.terminal_loc_spherical(
+                        this_side_ll[0], this_side_ll[1],
+                        alongtrack_start_buffer_dist,
+                        np.deg2rad(np.mod(sc_velocity_heading[idx]-180, 360)))
+                    this_side_point_buffer_deg = [[
+                        np.rad2deg(this_side_ll_buffer[0]),
+                        np.rad2deg(this_side_ll_buffer[1]),
+                        sc_llh[2]]]
+                    this_side_points_deg = \
+                        this_side_point_buffer_deg + this_side_points_deg
+
+                if idx == sc_xyz.shape[1]-1 \
+                   and alongtrack_end_buffer_dist is not None:
+                    this_side_ll_buffer = raster_crs.terminal_loc_spherical(
+                        this_side_ll[0], this_side_ll[1],
+                        alongtrack_start_buffer_dist,
+                        np.deg2rad(np.mod(sc_velocity_heading[idx], 360)))
+                    this_side_point_buffer_deg = [[
+                        np.rad2deg(this_side_ll_buffer[0]),
+                        np.rad2deg(this_side_ll_buffer[1]),
+                        sc_llh[2]]]
+                    this_side_points_deg = \
+                        this_side_points_deg + this_side_point_buffer_deg
+
+                this_side_polygon_points.extend(
+                    [point[:2] for point in
+                     transf.TransformPoints(this_side_points_deg)])
+
+            polygon.extend(this_side_polygon_points[::polygon_side*2 - 1])
+
+        return polygon
+
+    def build_product(self, populate_values=True, polygon_points=None):
+        """ Assemble the product """
+        if self.projection_type.lower() == 'utm':
+            if self.debug_flag:
+                product = products.RasterUTMDebug()
+            else:
+                product = products.RasterUTM()
+        elif self.projection_type.lower() == 'geo':
+            if self.debug_flag:
+                product = products.RasterGeoDebug()
+            else:
+                product = products.RasterGeo()
+        else:
+            raise RasterUsageException(
+                f'Unknown projection type: {self.projection_type}')
+
+        product.history = datetime.datetime.now(datetime.UTC).strftime(
+            products.CREATION_FORMAT_STR)
+        product.cycle_number = self.cycle_number
+        product.pass_number = self.pass_number
+        product.scene_number = self.scene_number
+
+        # Sort tile level attributes based on swath side first,
+        # then the rest of the name (i.e. side_cycle_pass_tile)
+        sort_idx = np.argsort(
+            [f'{tile_name[-1].lower()}_{tile_cycle:03}_{tile_name[:-1]}'
+             for tile_cycle, tile_name in zip(
+                     self.tile_cycle_numbers, self.tile_names)])
+        product.tile_numbers = self.tile_numbers[sort_idx]
+        product.tile_names = ', '.join(self.tile_names[sort_idx])
+        product.tile_polarizations = ', '.join(
+            self.tile_polarizations[sort_idx])
+
+        product.resolution = self.resolution
+        product.time_granule_start = self.time_granule_start
+        product.time_granule_end = self.time_granule_end
+        product.time_coverage_start = self.time_coverage_start
+        product.time_coverage_end = self.time_coverage_end
+        product.geospatial_lon_min = self.geospatial_lon_min
+        product.geospatial_lon_max = self.geospatial_lon_max
+        product.geospatial_lat_min = self.geospatial_lat_min
+        product.geospatial_lat_max = self.geospatial_lat_max
+        product.left_first_longitude = self.left_first_longitude
+        product.left_first_latitude = self.left_first_latitude
+        product.left_last_longitude = self.left_last_longitude
+        product.left_last_latitude = self.left_last_latitude
+        product.right_first_longitude = self.right_first_longitude
+        product.right_first_latitude = self.right_first_latitude
+        product.right_last_longitude = self.right_last_longitude
+        product.right_last_latitude = self.right_last_latitude
+
+        coordinate_system = self.output_crs
+
+        if self.projection_type.lower() == 'utm':
+            product.utm_zone_num = self.utm_zone
+            product.mgrs_latitude_band = self.mgrs_band
+            product.x_min = self.x_min
+            product.x_max = self.x_max
+            product.y_min = self.y_min
+            product.y_max = self.y_max
+            product['x'] = self.x_vec
+            product['y'] = self.y_vec
+            product.VARIABLES['crs']['projected_crs_name'] = \
+                coordinate_system.GetName()
+            product.VARIABLES['crs']['false_northing'] = \
+                coordinate_system.GetProjParm('false_northing')
+            product.VARIABLES['crs']['longitude_of_central_meridian'] = \
+                coordinate_system.GetProjParm('central_meridian')
+        elif self.projection_type.lower() == 'geo':
+            product.longitude_min = self.x_min
+            product.longitude_max = self.x_max
+            product.latitude_min = self.y_min
+            product.latitude_max = self.y_max
+            product['longitude'] = self.x_vec
+            product['latitude'] = self.y_vec
+        else:
+            raise RasterUsageException(
+                f'Unknown projection type: {self.projection_type}')
+
+        product.VARIABLES['crs']['crs_wkt'] = coordinate_system.ExportToWkt()
+        product.VARIABLES['crs']['spatial_ref'] = \
+            product.VARIABLES['crs']['crs_wkt']
+
+        product.VARIABLES['illumination_time']['tai_utc_difference'] = \
+            self.tai_utc_difference
+        product.VARIABLES['illumination_time']['leap_second'] = \
+            self.leap_second
+
+        if populate_values:
+            if self.projection_type.lower() == 'utm':
+                product['longitude'] = self.longitude
+                product['latitude'] = self.latitude
+
+            product['illumination_time'] = self.illumination_time
+            product['illumination_time_tai'] = self.illumination_time_tai
+            product['inc'] = self.inc
+            product['cross_track'] = self.cross_track
+            product['n_other_pix'] = self.n_other_pix
+            product['ice_clim_flag'] = self.ice_clim_flag
+            product['ice_dyn_flag'] = self.ice_dyn_flag
+
+            if not self.skip_wse:
+                product['wse'] = self.wse
+                product['wse_qual_bitwise'] = self.wse_qual_bitwise
+                wse_qual_bitwise_var = product.VARIABLES['wse_qual_bitwise']
+                wse_qual_bitwise_var['classification_qual_suspect_mask'] = \
+                    products.int2hexattr(self.wse_class_qual_suspect)
+                wse_qual_bitwise_var['geolocation_qual_suspect_mask'] = \
+                    products.int2hexattr(self.wse_geo_qual_suspect)
+                wse_qual_bitwise_var['classification_qual_degraded_mask'] = \
+                    products.int2hexattr(self.wse_class_qual_degraded)
+                wse_qual_bitwise_var['geolocation_qual_degraded_mask'] = \
+                    products.int2hexattr(self.wse_geo_qual_degraded)
+                product['wse_qual'] = self.wse_qual
+                product['wse_uncert'] = self.wse_u
+                product['n_wse_pix'] = self.n_wse_pix
+                product['layover_impact'] = self.layover_impact
+                product['height_cor_xover'] = self.height_cor_xover
+                product['geoid'] = self.geoid
+                product['solid_earth_tide'] = self.solid_earth_tide
+                product['load_tide_fes'] = self.load_tide_fes
+                product['load_tide_got'] = self.load_tide_got
+                product['pole_tide'] = self.pole_tide
+                product['model_dry_tropo_cor'] = self.model_dry_tropo_cor
+                product['model_wet_tropo_cor'] = self.model_wet_tropo_cor
+                product['iono_cor_gim_ka'] = self.iono_cor_gim_ka
+
+            if not self.skip_area:
+                product['water_area'] = self.water_area
+                product['water_area_qual_bitwise'] = \
+                    self.water_area_qual_bitwise
+                area_qual_bitwise_var = \
+                    product.VARIABLES['water_area_qual_bitwise']
+                area_qual_bitwise_var['classification_qual_suspect_mask'] = \
+                    products.int2hexattr(self.area_class_qual_suspect)
+                area_qual_bitwise_var['geolocation_qual_suspect_mask'] = \
+                    products.int2hexattr(self.area_geo_qual_suspect)
+                area_qual_bitwise_var['classification_qual_degraded_mask'] = \
+                    products.int2hexattr(self.area_class_qual_degraded)
+                area_qual_bitwise_var['geolocation_qual_degraded_mask'] = \
+                    products.int2hexattr(self.area_geo_qual_degraded)
+                product['water_area_qual'] = self.water_area_qual
+                product['water_area_uncert'] = self.water_area_u
+                product['water_frac'] = self.water_frac
+                product['water_frac_uncert'] = self.water_frac_u
+                product['n_water_area_pix'] = self.n_water_area_pix
+                product['dark_frac'] = self.dark_frac
+                product['edge_frac'] = self.edge_frac
+
+            if not self.skip_sig0:
+                product['sig0'] = self.sig0
+                product['sig0_qual_bitwise'] = self.sig0_qual_bitwise
+                sig0_qual_bitwise_var = product.VARIABLES['sig0_qual_bitwise']
+                sig0_qual_bitwise_var['sig0_qual_suspect_mask'] = \
+                    products.int2hexattr(self.sig0_qual_suspect)
+                sig0_qual_bitwise_var['classification_qual_suspect_mask'] = \
+                    products.int2hexattr(self.sig0_class_qual_suspect)
+                sig0_qual_bitwise_var['geolocation_qual_suspect_mask'] = \
+                    products.int2hexattr(self.sig0_geo_qual_suspect)
+                sig0_qual_bitwise_var['sig0_qual_degraded_mask'] = \
+                    products.int2hexattr(self.sig0_qual_degraded)
+                sig0_qual_bitwise_var['classification_qual_degraded_mask'] = \
+                    products.int2hexattr(self.sig0_class_qual_degraded)
+                sig0_qual_bitwise_var['geolocation_qual_degraded_mask'] = \
+                    products.int2hexattr(self.sig0_geo_qual_degraded)
+                product['sig0_qual'] = self.sig0_qual
+                product['sig0_uncert'] = self.sig0_u
+                product['sig0_cor_atmos_model'] = self.sig0_cor_atmos_model
+                product['n_sig0_pix'] = self.n_sig0_pix
+
+            if self.debug_flag:
+                product['classification'] = self.classification
+
+        # Crop the product to the desired bounds
+        if polygon_points is not None:
+            product.crop_to_bounds(polygon_points)
+
+        return product
